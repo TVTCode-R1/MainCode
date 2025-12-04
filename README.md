@@ -23,6 +23,7 @@ Key Files:
 **Scenario_Test.py**: Evaluates generalization capability in scenarios with randomized start/goal positions.
 
 **Robustness_Test.py**: Stress testing in highly dynamic environments (e.g., swinging obstacles).
+**Note**: We have abstracted the core training workflow for the agents and provided two representative testing scenarios (Scenario & Robustness tests). However, the specific implementation of the trajectory coupling with the OCP layer requires reference to the methodology detailed in the paper.
 
 ### 2. Lower-Level: Optimal Control Layer
 

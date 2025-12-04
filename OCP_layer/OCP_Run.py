@@ -1,1 +1,334 @@
+import os
+import time
+import pickle
+import numpy as np
+import pandas as pd
+import casadi as ca
+from SFC_Construction import sfc_main
+from RSFC_Construction import rsfc_test
 
+os.environ['DYLD_LIBRARY_PATH'] = '/usr/local/lib/coinhsl/lib:' + os.environ.get('DYLD_LIBRARY_PATH', '')
+
+def load_global_parameters():
+    file_path = 'global_param.pkl'
+    with open(file_path, 'rb') as f:
+        global_param = pickle.load(f)
+    return global_param
+
+def save_global_parameters(global_param):
+    file_path = 'global_param.pkl'
+    with open(file_path, 'wb') as f:
+        pickle.dump(global_param, f)
+
+def load_marl_guess():
+    try:
+        with open('marl_solution.pkl', 'rb') as f:
+            data = pickle.load(f)
+        return data['initial_conditions'], data['final_conditions'], data['ig_trajs']
+    except FileNotFoundError:
+        print("Error: MARL solution file not found. Please run the upper-level planner first.")
+        raise
+
+def nlp_solve(global_param, traj, initial_conditions, final_conditions):
+    Nfe = global_param.Optimal['nfe']
+    vmax = global_param.Vehicle['vmax']
+    vmin = global_param.Vehicle['vmin']
+    amax = global_param.Vehicle['amax']
+    phymax = global_param.Vehicle['phymax']
+    wmax = global_param.Vehicle['wmax']
+    L_wheelbase = global_param.Vehicle['lw']
+    w_a = global_param.Optimal['w_a']
+    m2p = 2
+    num_cars = len(initial_conditions)
+
+    cars = []
+    constraints = []
+    lbg = []
+    ubg = []
+
+    for i in range(num_cars):
+        car = {
+            'x': ca.SX.sym('x', Nfe),
+            'y': ca.SX.sym('y', Nfe),
+            'theta': ca.SX.sym('theta', Nfe),
+            'v': ca.SX.sym('v', Nfe),
+            'a': ca.SX.sym('a', Nfe),
+            'phy': ca.SX.sym('phy', Nfe),
+            'w': ca.SX.sym('w', Nfe),
+            'xm': ca.SX.sym('xm', Nfe),
+            'ym': ca.SX.sym('ym', Nfe)
+        }
+        cars.append(car)
+
+    scaling_factors = {}
+    for i in range(num_cars):
+        for j in range(i + 1, num_cars):
+            name = f"{i}-{j}"
+            RSFC = global_param.Cur_group['RSFC'][name]
+            if len(RSFC) != 0:
+                for k in range(Nfe):
+                    e_name = f"e_{i}_{j}_{k}"
+                    scaling_factors[e_name] = ca.SX.sym(e_name)
+                    constraints.append(scaling_factors[e_name])
+                    lbg.append(0)
+                    ubg.append(ca.inf)
+
+    objective = 0
+    for e_name in scaling_factors:
+        objective += scaling_factors[e_name]
+
+    tf = 40
+    hi = tf / (Nfe - 1)
+    
+    for i, car in enumerate(cars):
+        objective += w_a * ca.sum1(car['a'] ** 2) + 100 * ca.sum1(car['w'] ** 2) + \
+                     1 * ((car['x'][-1] - final_conditions[i][1]) ** 2 + (car['y'][-1] - final_conditions[i][2]) ** 2)
+
+        w_t = 1
+        for k in range(1, Nfe):
+            objective += 10000 * (
+                (car['x'][k] - car['x'][k - 1] - hi * car['v'][k] * ca.cos(car['theta'][k])) ** 2 +
+                (car['y'][k] - car['y'][k - 1] - hi * car['v'][k] * ca.sin(car['theta'][k])) ** 2 +
+                (car['v'][k] - car['v'][k - 1] - hi * car['a'][k]) ** 2 +
+                (car['theta'][k] - car['theta'][k - 1] - hi * ca.tan(car['phy'][k]) * car['v'][k] / L_wheelbase) ** 2 +
+                (car['phy'][k] - car['phy'][k - 1] - w_t * hi * car['w'][k]) ** 2 +
+                (car['xm'][k] - car['x'][k] - m2p * ca.cos(car['theta'][k])) ** 2 +
+                (car['ym'][k] - car['y'][k] - m2p * ca.sin(car['theta'][k])) ** 2
+            )
+
+    for i in range(num_cars):
+        car = cars[i]
+        
+        constraints.append(car['a'][0] - 0)
+        constraints.append(car['w'][0] - 0)
+        constraints.append(car['theta'][0] - initial_conditions[i][0])
+        constraints.append(car['v'][0] - 3)
+        lbg.extend([0, 0, 0, 0])
+        ubg.extend([0, 0, 0, 0])
+
+        constraints.append(car['a'][-1] - 0)
+        constraints.append(car['w'][-1] - 0)
+        constraints.append(car['theta'][-1] - final_conditions[i][0])
+        constraints.append(car['v'][-1] - 6)
+        lbg.extend([0, 0, 0, 0])
+        ubg.extend([0, 0, 0, 0])
+
+        for var in [car['v'], car['a'], car['phy'], car['w']]:
+            constraints.append(var)
+        
+        lbg.extend([vmin] * Nfe)
+        lbg.extend([-amax] * Nfe)
+        lbg.extend([-phymax] * Nfe)
+        lbg.extend([-wmax] * Nfe)
+
+        ubg.extend([vmax] * Nfe)
+        ubg.extend([amax] * Nfe)
+        ubg.extend([phymax] * Nfe)
+        ubg.extend([wmax] * Nfe)
+
+        name = 'NO_' + str(i)
+        SFC = global_param.Cur_group['SFC'][name]
+        for j in range(Nfe):
+            constraints.append(car['x'][j])
+            lbg.append(SFC[j, 0])
+            ubg.append(SFC[j, 1])
+            constraints.append(car['y'][j])
+            lbg.append(SFC[j, 2])
+            ubg.append(SFC[j, 3])
+
+    for i in range(num_cars):
+        for j in range(i + 1, num_cars):
+            name = f"{i}-{j}"
+            RSFC = global_param.Cur_group['RSFC'][name]
+            if len(RSFC) != 0:
+                for k in range(Nfe):
+                    e_i_j_k = scaling_factors[f"e_{i}_{j}_{k}"]
+                    
+                    x_rel = cars[i]['x'][k] - cars[j]['x'][k]
+                    constraints.append(x_rel + e_i_j_k)
+                    lbg.append(RSFC[k, 0])
+                    ubg.append(ca.inf)
+                    
+                    constraints.append(x_rel - e_i_j_k)
+                    lbg.append(-ca.inf)
+                    ubg.append(RSFC[k, 1])
+
+                    y_rel = cars[i]['y'][k] - cars[j]['y'][k]
+                    constraints.append(y_rel + e_i_j_k)
+                    lbg.append(RSFC[k, 2])
+                    ubg.append(ca.inf)
+                    
+                    constraints.append(y_rel - e_i_j_k)
+                    lbg.append(-ca.inf)
+                    ubg.append(RSFC[k, 3])
+
+    all_variables = ca.vertcat(
+        *[car[key] for car in cars for key in car],
+        *[scaling_factors[e_name] for e_name in scaling_factors]
+    )
+
+    initial_solutions = {
+        i: {
+            'x': traj[f'{i}']['x'],
+            'y': traj[f'{i}']['y'],
+            'theta': traj[f'{i}']['theta'],
+            'v': traj[f'{i}']['v'],
+            'a': traj[f'{i}']['a'],
+            'phy': traj[f'{i}']['phy'],
+            'w': traj[f'{i}']['w'],
+            'xm': traj[f'{i}']['xm'],
+            'ym': traj[f'{i}']['ym'],
+        } for i in range(num_cars)
+    }
+
+    scaling_factors_initial_values = []
+    initial_e_value = 0
+    for i in range(num_cars):
+        for j in range(i + 1, num_cars):
+            name = f"{i}-{j}"
+            RSFC = global_param.Cur_group['RSFC'][name]
+            if len(RSFC) != 0:
+                for k in range(Nfe):
+                    scaling_factors_initial_values.append(initial_e_value)
+
+    opts = {
+        'ipopt': {
+            'tol': 1e-4,
+            'max_iter': 2000,
+            'print_level': 5,
+            'linear_solver': 'MA27',
+            'acceptable_tol': 1e-3,
+        }
+    }
+
+    x0 = ca.vertcat(
+        *[ca.DM(initial_solutions[car_idx][key]) for car_idx in range(num_cars) for key in cars[car_idx]],
+        *[ca.DM(scaling_factors_initial_values)]
+    )
+
+    nlp_problem = {'f': objective, 'x': all_variables, 'g': ca.vertcat(*constraints)}
+    solver = ca.nlpsol('solver', 'ipopt', nlp_problem, opts)
+    solution = solver(x0=x0, lbg=ca.vertcat(*lbg), ubg=ca.vertcat(*ubg))
+    solver_stats = solver.stats()
+    total_time = solver_stats['t_wall_total']
+
+    solution_values = np.array(solution['x']).flatten()
+    
+    writer = pd.ExcelWriter('vehicle_solutions_MARL.xlsx', engine='openpyxl')
+    num_vars_per_car = 9
+    start_index_e = num_cars * num_vars_per_car * Nfe
+    
+    traj = {
+        f"{i}": {
+            'x': [], 'y': [], 'theta': [], 'v': [], 'a': [],
+            'phy': [], 'w': [], 'xm': [], 'ym': []
+        } for i in range(num_cars)
+    }
+
+    for car_idx in range(num_cars):
+        base_index = car_idx * num_vars_per_car * Nfe
+        data = {
+            'time_step': list(range(Nfe)),
+            'x': solution_values[base_index:base_index + Nfe],
+            'y': solution_values[base_index + Nfe:base_index + 2 * Nfe],
+            'theta': solution_values[base_index + 2 * Nfe:base_index + 3 * Nfe],
+            'v': solution_values[base_index + 3 * Nfe:base_index + 4 * Nfe],
+            'a': solution_values[base_index + 4 * Nfe:base_index + 5 * Nfe],
+            'phy': solution_values[base_index + 5 * Nfe:base_index + 6 * Nfe],
+            'w': solution_values[base_index + 6 * Nfe:base_index + 7 * Nfe],
+            'xm': solution_values[base_index + 7 * Nfe:base_index + 8 * Nfe],
+            'ym': solution_values[base_index + 8 * Nfe:base_index + 9 * Nfe],
+        }
+        for var in ['x', 'y', 'theta', 'v', 'a', 'phy', 'w', 'xm', 'ym']:
+            traj[f"{car_idx}"][var] = np.array(data[var])
+        
+        df = pd.DataFrame(data)
+        df.to_excel(writer, sheet_name=f'Car_{car_idx}', index=False)
+
+    e_values = solution_values[start_index_e:]
+    pair_index = 0
+    for i in range(num_cars):
+        for j in range(i + 1, num_cars):
+            e_name = f"e_{i}_{j}"
+            e_data = e_values[pair_index * Nfe:(pair_index + 1) * Nfe]
+            pair_index += 1
+            df_e = pd.DataFrame({e_name: e_data})
+            df_e.to_excel(writer, sheet_name=e_name, index=False)
+
+    writer.close()
+
+    total_infeasibility = 0
+    
+    for car_idx in range(num_cars):
+        car_infeasibility = 0
+        base_index = car_idx * num_vars_per_car * Nfe
+        car_data = {
+            'x': solution_values[base_index:base_index + Nfe],
+            'y': solution_values[base_index + Nfe:base_index + 2 * Nfe],
+            'theta': solution_values[base_index + 2 * Nfe:base_index + 3 * Nfe],
+            'v': solution_values[base_index + 3 * Nfe:base_index + 4 * Nfe],
+            'a': solution_values[base_index + 4 * Nfe:base_index + 5 * Nfe],
+            'phy': solution_values[base_index + 5 * Nfe:base_index + 6 * Nfe],
+            'w': solution_values[base_index + 6 * Nfe:base_index + 7 * Nfe],
+        }
+        for k in range(1, Nfe):
+            car_infeasibility += (
+                (car_data['x'][k] - car_data['x'][k - 1] - hi * car_data['v'][k] * np.cos(car_data['theta'][k])) ** 2 +
+                (car_data['y'][k] - car_data['y'][k - 1] - hi * car_data['v'][k] * np.sin(car_data['theta'][k])) ** 2 +
+                (car_data['v'][k] - car_data['v'][k - 1] - hi * car_data['a'][k]) ** 2 +
+                (car_data['theta'][k] - car_data['theta'][k - 1] - hi * np.tan(car_data['phy'][k]) * car_data['v'][k] / L_wheelbase) ** 2 +
+                (car_data['phy'][k] - car_data['phy'][k - 1] - hi * car_data['w'][k]) ** 2
+            )
+        total_infeasibility += car_infeasibility
+
+    return total_infeasibility, traj, data, total_time
+
+def run_nlp():
+    global_param = load_global_parameters()
+    iter_count = 0
+    
+    print("Initializing OCP with MARL-generated coarse trajectory...")
+    start_time0 = time.time()
+    initial_conditions, final_conditions, ig_trajs = load_marl_guess()
+    SFM_time = time.time() - start_time0
+
+    traj = ig_trajs
+    SFC_time = []
+    RSFC_time = []
+    NLP_time = []
+
+    while iter_count < global_param.Optimal['max_iter']:
+        iter_count += 1
+        
+        start_time = time.time()
+        sfc_main(traj, global_param)
+        elapsed_time = time.time() - start_time
+        SFC_time.append(elapsed_time)
+        global_param = load_global_parameters()
+
+        start_time1 = time.time()
+        rsfc_test(traj, global_param)
+        elapsed_time1 = time.time() - start_time1
+        RSFC_time.append(elapsed_time1)
+        global_param = load_global_parameters()
+
+        infeasibility, temp_traj, data, nlp_time = nlp_solve(
+            global_param, traj, initial_conditions, final_conditions
+        )
+        NLP_time.append(nlp_time)
+        
+        global_param.Cur_group_solution['traj'] = temp_traj
+        global_param.Cur_group_solution['source_id'] = global_param.Cur_group['stage2']['source_id']
+        global_param.Cur_group_solution['goal_id'] = global_param.Cur_group['stage2']['goal_id']
+        global_param.Cur_group_solution['dis'] = global_param.Cur_group['stage2']['dis']
+        save_global_parameters(global_param)
+        
+        if infeasibility < 0.000001:
+            break
+            
+        traj = temp_traj
+
+    return SFM_time, SFC_time, RSFC_time, NLP_time
+
+if __name__ == "__main__":
+    run_nlp()
